@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 """
-REAL-robot bridge for the chi-Haptics interface.
+SIM bridge for the chi-Haptics interface (bench testing, no robot).
 
-Subscribes to a geometry_msgs/WrenchStamped F/T sensor topic and renders only
-the INTERACTION torque via gated-tare: the baseline (gravity / pose / mounting
-offset) adapts ONLY when out of contact and freezes during a push, so a
-sustained contact is rendered at its true magnitude for its whole duration.
+Subscribes to std_msgs/Float32 on /kinova/sim_torque (from fake_torque_pub)
+and maps |torque| directly to a pressure target. No gated-tare: the fake
+signal has no gravity baseline to reject.
 
-Also:
-  - throttles serial writes to a fixed rate (decoupled from sensor rate),
-  - forces a DTR reset pulse on connect so fast reconnects don't hang the R4,
-  - continuously drains Arduino telemetry (R4 USB CDC blocks if not read),
-  - sends a keepalive so the firmware watchdog does not trip,
-  - vents on shutdown.
+Shares all serial handling with the real bridge: fixed-rate writes, DTR
+reset pulse on connect, telemetry drain, keepalive, vent on shutdown.
 """
 import threading
 import time
@@ -20,54 +15,40 @@ import time
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32
-from geometry_msgs.msg import WrenchStamped
 import serial
 
 KEEPALIVE_PERIOD_S = 1.0
 OUTPUT_PERIOD_S = 0.05          # 20 Hz to the Arduino
 
 
-class KinovaHapticBridge(Node):
+class KinovaHapticBridgeSim(Node):
     def __init__(self):
-        super().__init__('kinova_haptic_bridge')
+        super().__init__('kinova_haptic_bridge_sim')
 
-        # --- parameters ---
         self.declare_parameter('serial_port', '/dev/ttyACM0')
         self.declare_parameter('baud_rate', 115200)
-        self.declare_parameter('wrench_topic', '/ft_sensor_lin/wrench')
-        self.declare_parameter('torque_axis', 'y')         # 'x' | 'y' | 'z'
-        self.declare_parameter('max_input', 6.0)           # torque at full scale (Nm)
-        self.declare_parameter('max_pressure', 60.0)       # kPa at full scale
-        self.declare_parameter('baseline_alpha', 0.995)    # closer to 1 = slower baseline
-        self.declare_parameter('engage_threshold', 0.30)   # Nm above baseline -> contact
-        self.declare_parameter('release_threshold', 0.15)  # Nm -> leave contact
+        self.declare_parameter('sim_topic', '/kinova/sim_torque')
+        self.declare_parameter('sim_max_torque', 5.0)
+        self.declare_parameter('max_pressure', 60.0)
 
         p = self.get_parameter
         port = p('serial_port').value
         baud = p('baud_rate').value
-        self.topic = p('wrench_topic').value
-        self.axis = p('torque_axis').value
-        self.max_input = float(p('max_input').value)
+        self.topic = p('sim_topic').value
+        self.sim_max_torque = float(p('sim_max_torque').value)
         self.max_pressure = float(p('max_pressure').value)
-        self.alpha = float(p('baseline_alpha').value)
-        self.engage = float(p('engage_threshold').value)
-        self.release = float(p('release_threshold').value)
 
-        # --- state ---
         self.pending_pressure = 0.0
         self.last_sent = None
         self.write_lock = threading.Lock()
-        self.baseline = None
-        self.in_contact = False
 
         self._open_serial(port, baud)
 
         self.actual_pub = self.create_publisher(Float32, '/pressure/actual_kpa', 10)
         self.echo_pub = self.create_publisher(Float32, '/pressure/target_kpa_echo', 10)
-        self.create_subscription(WrenchStamped, self.topic, self.on_wrench, 10)
+        self.create_subscription(Float32, self.topic, self.on_sim, 10)
         self.get_logger().info(
-            f'REAL mode: {self.topic}, axis={self.axis}, max_input={self.max_input} Nm, '
-            f'engage={self.engage}, release={self.release}')
+            f'SIM mode: {self.topic}, sim_max_torque={self.sim_max_torque} Nm')
 
         self.create_timer(OUTPUT_PERIOD_S, self.push_to_arduino)
         self.create_timer(KEEPALIVE_PERIOD_S, self.keepalive)
@@ -76,18 +57,14 @@ class KinovaHapticBridge(Node):
         self.reader = threading.Thread(target=self.read_loop, daemon=True)
         self.reader.start()
 
-    # ---------- serial ----------
-
     def _open_serial(self, port, baud):
         try:
             self.ser = serial.Serial()
             self.ser.port = port
             self.ser.baudrate = baud
             self.ser.timeout = 1.0
-            self.ser.dtr = False          # hold reset low before open
+            self.ser.dtr = False
             self.ser.open()
-            # Explicit DTR low->high pulse forces the R4 to reset even on a
-            # fast reconnect, replacing the manual unplug/replug.
             self.ser.dtr = False
             time.sleep(0.1)
             self.ser.dtr = True
@@ -111,31 +88,10 @@ class KinovaHapticBridge(Node):
             except serial.SerialException as e:
                 self.get_logger().error(f'Serial write failed: {e}')
 
-    # ---------- input (compute only) ----------
-
-    def on_wrench(self, msg: WrenchStamped):
-        raw = getattr(msg.wrench.torque, self.axis)
-
-        if self.baseline is None:
-            self.baseline = raw
-
-        deviation = raw - self.baseline
-        mag = abs(deviation)
-
-        if mag > self.engage:
-            self.in_contact = True
-        elif mag < self.release:
-            self.in_contact = False
-
-        # Adapt baseline only out of contact; freeze during a push.
-        if not self.in_contact:
-            self.baseline = self.alpha * self.baseline + (1.0 - self.alpha) * raw
-
-        interaction = mag if self.in_contact else 0.0
+    def on_sim(self, msg: Float32):
+        tau = msg.data
         self.pending_pressure = min(
-            interaction / self.max_input * self.max_pressure, self.max_pressure)
-
-    # ---------- fixed-rate writer ----------
+            abs(tau) / self.sim_max_torque * self.max_pressure, self.max_pressure)
 
     def push_to_arduino(self):
         command = f'{self.pending_pressure:.2f}'
@@ -147,8 +103,6 @@ class KinovaHapticBridge(Node):
     def keepalive(self):
         self.send(self.last_sent if self.last_sent is not None else '0.00',
                   log=False)
-
-    # ---------- telemetry reader ----------
 
     def read_loop(self):
         while not self._stop and rclpy.ok():
@@ -196,7 +150,7 @@ class KinovaHapticBridge(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = KinovaHapticBridge()
+    node = KinovaHapticBridgeSim()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

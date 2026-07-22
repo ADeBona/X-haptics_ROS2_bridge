@@ -22,6 +22,7 @@ setup(
         'console_scripts': [
             'fake_torque_pub = kinova_haptic_teleop.fake_torque_pub:main',
             'kinova_haptic_bridge = kinova_haptic_teleop.kinova_haptic_bridge:main',
+            'kinova_haptic_bridge_sim = kinova_haptic_teleop.kinova_haptic_bridge_sim:main',
         ],
     },
 )

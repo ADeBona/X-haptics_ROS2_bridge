@@ -8,8 +8,11 @@ services:
     privileged: true
     volumes:
       - ../src:/ros2_ws/src
+      - ../config:/config:ro
       - /dev:/dev
-    devices:
-      - "/dev/ttyACM0:/dev/ttyACM0"   # ADD THIS BLOCK
+    environment:
+      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+      #- CYCLONEDDS_URI=file:///config/cyclonedds.xml
+      - ROS_DOMAIN_ID=0
     stdin_open: true
     tty: true

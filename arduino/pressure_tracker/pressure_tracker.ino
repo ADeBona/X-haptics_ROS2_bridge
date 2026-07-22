@@ -1,6 +1,8 @@
 /*
  * PURE DIGITAL PRESSURE TRACKER - NON-BLOCKING REVERSE-PFM
- * optimised bounds: 6 ms burst, T_off 95 ms (low P) to 164 ms (high P).
+ * RL-optimised bounds: 6 ms burst, T_off 95 ms (low P) to 164 ms (high P).
+ * Includes a command watchdog: if no serial command arrives within
+ * COMMAND_TIMEOUT_MS, the target falls back to zero and the system vents.
  */
 
 const int SENSOR_PIN = A0;
@@ -8,14 +10,19 @@ const int PUMP_PIN   = 3;
 const int VALVE_PIN  = 5;
 
 const float MAX_PRESSURE = 60.0;
-const float DEADBAND_KPA = 2.5;
+const float DEADBAND_KPA = 1.5;
 
 // Reverse-PFM parameters
-const unsigned long BURST_MS = 7;     // minimum mechanical actuation time
+const unsigned long BURST_MS = 6;     // minimum mechanical actuation time
 const int P_LOW  = 10;                // kPa, lower bound of the T_off map
 const int P_HIGH = 50;                // kPa, upper bound of the T_off map
 int settle_min = 95;                  // T_off at P_LOW
 int settle_max = 164;                 // T_off at P_HIGH
+
+// Safety watchdog
+const unsigned long COMMAND_TIMEOUT_MS = 3000;
+unsigned long lastCommandTime = 0;
+bool watchdog_tripped = false;
 
 float target_kPa = 0.0;
 float sensor_offset_kPa = 0.0;
@@ -41,6 +48,7 @@ void setup() {
   digitalWrite(PUMP_PIN, LOW);
   digitalWrite(VALVE_PIN, LOW);
   calibrateSensorOffset();
+  lastCommandTime = millis();
 }
 
 void loop() {
@@ -57,7 +65,7 @@ void loop() {
           if (serialBuffer[i] == ',') commaCount++;
         }
         if (commaCount == 2) {
-          // "target,settle_max,settle_min" for live RL tuning
+          // "target,settle_max,settle_min" for live tuning
           char* t_str   = strtok(serialBuffer, ",");
           char* max_str = strtok(NULL, ",");
           char* min_str = strtok(NULL, ",");
@@ -65,9 +73,13 @@ void loop() {
             target_kPa = constrain(atof(t_str), 0.0, MAX_PRESSURE);
             settle_max = constrain(atoi(max_str), 50, 300);
             settle_min = constrain(atoi(min_str), 10, 150);
+            lastCommandTime = now;
+            watchdog_tripped = false;
           }
         } else {
           target_kPa = constrain(atof(serialBuffer), 0.0, MAX_PRESSURE);
+          lastCommandTime = now;
+          watchdog_tripped = false;
         }
         bufferIndex = 0;
       }
@@ -78,14 +90,25 @@ void loop() {
     }
   }
 
-  // ---- 2. READ & TARE ----
+  // ---- 2. WATCHDOG ----
+  // No command for COMMAND_TIMEOUT_MS means the host is gone, the USB cable
+  // was pulled, or the bridge crashed. Fail safe: vent to atmosphere.
+  if (now - lastCommandTime > COMMAND_TIMEOUT_MS) {
+    if (!watchdog_tripped) {
+      Serial.println("WATCHDOG:timeout, venting");
+      watchdog_tripped = true;
+    }
+    target_kPa = 0.0;
+  }
+
+  // ---- 3. READ & TARE ----
   float actual_kPa = convertADCToKPa(analogRead(SENSOR_PIN)) - sensor_offset_kPa;
   if (actual_kPa < 0.0) actual_kPa = 0.0;
   float error = target_kPa - actual_kPa;
 
-  // ---- 3. CLOSED-LOOP CONTROL ----
+  // ---- 4. CLOSED-LOOP CONTROL ----
   if (target_kPa <= 0.1 && actual_kPa < 2.0) {
-    // FULL EXHAUST: purge the last residual air without chattering
+    // FULL EXHAUST: purge residual air without chattering
     digitalWrite(PUMP_PIN, LOW);
     digitalWrite(VALVE_PIN, HIGH);
     valve_open = false;
@@ -106,7 +129,6 @@ void loop() {
         digitalWrite(VALVE_PIN, LOW);
         valve_open = false;
         pfm_timer = now;
-        // Recompute T_off from the pressure at the end of this burst
         current_settle = constrain(
             map((int)actual_kPa, P_LOW, P_HIGH, settle_min, settle_max),
             settle_min, settle_max);
@@ -127,7 +149,7 @@ void loop() {
     pfm_timer = now;
   }
 
-  // ---- 4. TELEMETRY ----
+  // ---- 5. TELEMETRY ----
   if (now - lastLogTime >= LOG_INTERVAL_MS) {
     Serial.print("Target:");
     Serial.print(target_kPa);

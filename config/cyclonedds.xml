@@ -6,8 +6,9 @@
         </General>
         <Discovery>
             <Peers>
-                <Peer address="10.186.85.98"/>
-                <Peer address="10.186.85.30"/>
+                <Peer address="localhost"/>      <!-- same-machine nodes -->
+                <Peer address="10.186.85.98"/>   <!-- robot PC (TU lab) -->
+                <Peer address="10.186.85.30"/>   <!-- this Pi on TU lab -->
             </Peers>
         </Discovery>
     </Domain>

@@ -4,6 +4,7 @@ RUN apt-get update && apt-get install -y \
     python3-colcon-common-extensions \
     python3-pip \
     python3-serial \
+    ros-humble-rmw-cyclonedds-cpp \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /ros2_ws
