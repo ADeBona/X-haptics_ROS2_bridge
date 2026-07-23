@@ -8,7 +8,7 @@
             <Peers>
                 <Peer address="localhost"/>      <!-- same-machine nodes -->
                 <Peer address="10.186.85.98"/>   <!-- robot PC (TU lab) -->
-                <Peer address="10.186.85.30"/>   <!-- this Pi on TU lab -->
+                <Peer address="10.42.0.232"/>   <!-- this Pi on TU lab -->
             </Peers>
         </Discovery>
     </Domain>
