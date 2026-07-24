@@ -1,6 +1,17 @@
 # QUICK GUIDE — chi-Haptics Bridge
 
-Every command below runs **inside the Docker container** unless marked `[HOST]`.
+Every command runs **inside the Docker container** unless marked `[HOST]`.
+Two separate workflows live in this repo:
+
+- **Teleoperation** (§1–§6) — the production system: robot torque → pad pressure.
+- **Pad characterisation** (§7–§10) — the test rig: measure and tune a new pad.
+
+They use **different Arduino firmware**. Flash the right one before starting.
+
+| Workflow | Sketch | Runs from |
+|---|---|---|
+| Teleoperation | `arduino/pressure_tracker` | container (ROS) |
+| Characterisation | `arduino/pad_characterisation` | `[HOST]` (plain Python) |
 
 ---
 
@@ -45,14 +56,14 @@ Expect: `fake_torque_pub`, `kinova_haptic_bridge`, `kinova_haptic_bridge_sim`.
 
 ## 2. FAKE mode — bench test, no robot
 
-**Terminal 1** — the bridge (reads simulated torque, drives the Arduino):
+**Terminal 1** — the bridge:
 ```bash
 docker exec -it kinova_haptic_humble bash
 source install/setup.bash
 ros2 run kinova_haptic_teleop kinova_haptic_bridge_sim
 ```
 
-**Terminal 2** — the keyboard torque simulator (UP/DOWN arrows, `q` to quit):
+**Terminal 2** — keyboard torque simulator (UP/DOWN arrows, `q` to quit):
 ```bash
 docker exec -it kinova_haptic_humble bash
 source install/setup.bash
@@ -73,7 +84,7 @@ ros2 topic pub /kinova/sim_torque std_msgs/msg/Float32 "{data: 1.0}" -r 10
 
 ## 3. REAL mode — with the robot
 
-Preferred: use the params file (avoids the YAML `y` → boolean trap):
+Preferred — use the params file:
 ```bash
 docker exec -it kinova_haptic_humble bash
 source install/setup.bash
@@ -81,7 +92,7 @@ ros2 run kinova_haptic_teleop kinova_haptic_bridge --ros-args \
   --params-file /config/bridge_real.yaml
 ```
 
-Same thing on the command line, if you need a one-off override:
+Command line, for a one-off override:
 ```bash
 ros2 run kinova_haptic_teleop kinova_haptic_bridge --ros-args \
   -p serial_port:=/dev/serial/by-id/usb-Arduino_UNO_WiFi_R4_CMSIS-DAP_F412FA654890-if01 \
@@ -95,7 +106,7 @@ The `"'y'"` quoting is required. YAML reads bare `y` as the boolean `true`, whic
 
 ## 4. The params file
 
-`config/bridge_real.yaml` on the host, mounted read-only at `/config/` inside the container. Edit it in VS Code, no rebuild needed — just restart the node.
+`config/bridge_real.yaml` on the host, mounted read-only at `/config/` inside the container. Edit in VS Code, no rebuild needed — just restart the node.
 
 ```yaml
 /kinova_haptic_bridge:
@@ -113,12 +124,12 @@ The `"'y'"` quoting is required. YAML reads bare `y` as the boolean `true`, whic
 | Parameter | Meaning | Tuning |
 |---|---|---|
 | `serial_port` | Arduino device. Use the `by-id` path — it survives re-enumeration, `ttyACM0` may not | — |
-| `torque_axis` | which wrench component to render: `"x"`, `"y"`, `"z"` | confirm empirically by pushing and watching the echo |
-| `max_input` | interaction torque (Nm) that maps to full pressure | set to the peak seen during a real push (~6 Nm at the valve stop) |
+| `torque_axis` | wrench component to render: `"x"`, `"y"`, `"z"` | confirm empirically by pushing and watching the echo |
+| `max_input` | interaction torque (Nm) mapping to full pressure | peak seen during a real push (~6 Nm at the valve stop) |
 | `max_pressure` | kPa at full scale | 60 is the firmware clamp |
-| `baseline_alpha` | how fast the gravity baseline adapts; closer to 1 = slower | lower it if idle output drifts above 0 |
-| `engage_threshold` | Nm above baseline that counts as contact | raise if noise triggers phantom contact |
-| `release_threshold` | Nm below which contact ends; must be < engage | the gap between the two is the hysteresis band |
+| `baseline_alpha` | how fast the gravity baseline adapts; closer to 1 = slower | lower if idle output drifts above 0 |
+| `engage_threshold` | Nm above baseline counting as contact | raise if noise triggers phantom contact |
+| `release_threshold` | Nm below which contact ends; must be < engage | the gap is the hysteresis band |
 | `auto_recover` | force USB re-enumeration when telemetry stalls | leave `true` |
 
 ---
@@ -141,7 +152,7 @@ s=serial.Serial('/dev/ttyACM0',115200,timeout=2); time.sleep(3)
 [print(s.readline().decode(errors='ignore').strip()) for _ in range(40)]
 "
 ```
-Shows the `State:` field too — `IDLE`, `INFLATE`, `DEFLATE`, `HOLD`, `PURGE`.
+Shows the `State:` field — `IDLE`, `INFLATE`, `DEFLATE`, `HOLD`, `PURGE`.
 
 ---
 
@@ -155,23 +166,124 @@ Shows the `State:` field too — `IDLE`, `INFLATE`, `DEFLATE`, `HOLD`, `PURGE`.
 
 ---
 
-## 7. Flashing the Arduino
+## 7. Pad characterisation — overview
 
-`[HOST]` — stop the bridge first, then confirm the port is free:
+Run this whenever a new pad design is built. Three phases:
+
+1. **Safe limit** — step pressure manually until you judge the pad is at its limit.
+2. **Inflation transient** — measure the rise time. This becomes `T_ref`.
+3. **Deflation optimisation** — Bayesian optimisation of the reverse-PFM bounds so the descent approximates a linear ramp of duration `T_ref`.
+
+Results go in `pads/<pad_name>/`, one folder per design, so successive pads stay comparable.
+
+**Flash the characterisation firmware first.** The scripts speak a different serial protocol (`U`/`D`/`I`/`F` commands, `D,` telemetry) and will sit silent against `pressure_tracker.ino`.
+
+`[HOST]`:
 ```bash
-sudo lsof /dev/ttyACM0     # must print nothing
+sudo lsof /dev/ttyACM0     # must print nothing — see §11 if the bridge holds it
+cd ~/kinova_haptic_ws/arduino
+./flash_arduino.sh         # choose 2) pad_characterisation
 ```
-Then flash from the Arduino IDE (board: **Arduino UNO R4 WiFi**) or:
+
+Scripts run on the **host**, not in the container — they need only pyserial, numpy and matplotlib, no ROS:
 ```bash
-arduino-cli compile --fqbn arduino:renesas_uno:unor4wifi arduino/pressure_tracker
-arduino-cli upload -p /dev/ttyACM0 --fqbn arduino:renesas_uno:unor4wifi arduino/pressure_tracker
+sudo apt install python3-numpy python3-matplotlib -y
+cd ~/kinova_haptic_ws/scripts
 ```
 
 ---
 
-## 8. When something breaks
+## 8. Phase 1 & 2 — safe limit and inflation
 
-**Arduino goes deaf, reset button does not help.** The USB CDC endpoint has stalled while still enumerated. `auto_recover: true` handles this automatically. Manually, `[HOST]`:
+```bash
+python3 pad_logger.py --port /dev/ttyACM0 --out ../pads/pad_v2_55x30_shore10
+```
+
+Menu:
+- `1` manual stepping — UP/DOWN in 2 kPa steps, `z` vents, `q` exits. Reports the max reached.
+- `2` inflation test — vent, settle, full pump to target. Reports **RISE TIME**, writes `inflation.csv` and `inflation.png`.
+- `3` single deflation test — one descent at chosen `T_max`/`T_min`. Useful for sanity-checking before a full optimisation run.
+
+**Do phase 1 with the pad shielded, not on your arm.** The firmware refuses to exceed `HARD_CEILING_KPA = 80.0`, but you are looking for where the pad fails.
+
+Note the rise time from phase 2 — that is `--tref` for the optimiser.
+
+A closed-loop hold will *not* reveal a leak: bang-bang keeps topping up and hides it. The only open-loop window is the deflation test's settle phase, which is why the firmware tops the pad up immediately before each descent.
+
+---
+
+## 9. Phase 3 — deflation optimisation
+
+```bash
+python3 pad_optimize.py --port /dev/ttyACM0 \
+  --start 30 --tref 2244 --trials 25 \
+  --out ../pads/pad_v2_55x30_shore10
+```
+
+25 trials at roughly 15–25 s each, so about 10 minutes. First 6 are random seeds, the rest Bayesian (GP surrogate, Matern 5/2, Expected Improvement).
+
+Watch the printed columns:
+
+| Column | Meaning | What to check |
+|---|---|---|
+| `MSE` | error against the ideal linear descent | should drop sharply once BO starts |
+| `dur` | actual descent duration | compare against `--tref` |
+| `p0` | **measured** start pressure | must be consistent across trials, and close to `--start` |
+| `n` | samples in the trace | too few means the descent terminated early |
+
+`p0` is the one to watch. If it varies by more than ~1 kPa, trials are not comparable and the optimum is fitting noise rather than parameters.
+
+Outputs: `optimum.json`, `optimisation_history.csv`, `deflation_best.csv`.
+
+Combined figure:
+```bash
+python3 plot_characterisation.py --dir ../pads/pad_v2_55x30_shore10
+```
+
+Then paste `T_max_ms` / `T_min_ms` from `optimum.json` into `pressure_tracker.ino` as `settle_max` / `settle_min`.
+
+**Anchor mismatch to watch for.** The production firmware interpolates between fixed anchors (10 and 50 kPa). The characterisation rig anchors on the test target and `DEFLATE_END_KPA`. If you characterise at a different start pressure, the bounds will not transfer directly — either characterise at the production anchor, or update the production anchors to match.
+
+---
+
+## 10. Reading the characterisation traces
+
+**Sensor transients during bursts.** While the valve is open, air flows past the sensor and the reading dips sharply, recovering over roughly 60–80 ms after close. At fast cycling the off-period is shorter than that recovery, so the firmware latches one clean sample immediately *before* each burst rather than trying to find a quiet window afterwards. The logged curve should be monotonic; visible spikes mean the latch is not being applied.
+
+**Steps per descent.** `RESULT,DEFLATE` reports the burst count. Around 30 bursts over a 20 kPa descent is ~0.6 kPa per burst — below the perceptual threshold for pressure, so the system is not volume-limited. If perceived roughness persists at that resolution, the cause is the valve's mechanical impulse travelling down the tubing, not the pressure steps. That is fixed by decoupling the valve (mount it off the pad, compliant tubing, foam under the body), not by control parameters.
+
+**Shape versus duration.** The MSE objective weights profile shape more heavily than total duration, so the winning candidate may finish faster than `T_ref`. If matching the inflation duration matters more than linearity, the duration term needs explicit weighting in `score()`.
+
+---
+
+## 11. Flashing the Arduino
+
+`[HOST]` — the port must be free. `arduino-cli` sends a 1200-baud touch to enter the bootloader; if anything holds the port it cannot, and the upload fails with `Device unsupported`.
+
+```bash
+sudo lsof /dev/ttyACM0
+```
+
+If the bridge appears, stop it:
+```bash
+sudo kill <PID>
+# or, if it is inside the container:
+cd ~/kinova_haptic_ws/docker && docker compose stop
+```
+
+Then:
+```bash
+cd ~/kinova_haptic_ws/arduino
+./flash_arduino.sh
+```
+
+If it still reports `Device unsupported`: **double-tap the reset button** to force the bootloader, check the new port with `ls -l /dev/serial/by-id/`, and upload to that port explicitly.
+
+---
+
+## 12. When something breaks
+
+**Arduino goes deaf, reset button does not help.** The USB CDC endpoint has stalled while still enumerated — only a bus-level re-enumeration clears it. `auto_recover: true` handles this automatically in the bridge. Manually, `[HOST]`:
 ```bash
 sudo python3 ~/kinova_haptic_ws/scripts/usb_reset.py
 ```
@@ -183,17 +295,21 @@ sudo python3 ~/kinova_haptic_ws/scripts/usb_reset.py
 ps aux | grep -E "fake_torque|kinova_haptic" | grep -v grep
 kill <PID>
 ```
-`ros2 node list` collapses duplicate node names, so it will *not* show you the duplicate. Use `ros2 topic info <topic> --verbose` and check the publisher count.
+`ros2 node list` collapses duplicate node names, so it will *not* show the duplicate. Use `ros2 topic info <topic> --verbose` and check the publisher count.
 
-**Arrow keys do nothing in `fake_torque_pub`.** Nested TTYs (tmux inside VS Code inside `docker exec`) can swallow escape sequences. Test in a plain SSH terminal.
+**Deflation test inflates and holds forever.** The settle phase is not completing. Check the `State:` field in telemetry — `DEF_SETTLE` that never advances to `DEF_RUN` means the timer is being reset each pass.
+
+**Arrow keys do nothing.** Nested TTYs (tmux inside VS Code inside `docker exec`) can swallow escape sequences. Test in a plain SSH terminal.
 
 **"No executable found".** You did not `colcon build`, or did not `source install/setup.bash`.
 
 **Nodes on the same machine cannot see each other.** The CycloneDDS peer list needs `localhost` in it, otherwise disabling multicast also disables same-machine discovery.
 
+**Valve gets very hot.** The production firmware caps continuous valve-on time and forces a cooldown, printing `VALVE:thermal cap`. If it heats at idle, the MOSFET gate is floating before `setup()` runs — fit a 10 kΩ pulldown from SIG to GND on both modules. Firmware cannot protect the pins before the firmware is running.
+
 ---
 
-## 9. Daily commit
+## 13. Daily commit
 
 `[HOST]`:
 ```bash
@@ -203,8 +319,8 @@ git commit -m "describe what changed"
 git push
 ```
 
-Tag a working milestone so you can always come back to it:
+Tag a working milestone:
 ```bash
-git tag -a v0.4-real-tested -m "Gated tare + USB auto-recovery, tested on robot"
+git tag -a v0.5-pad-v2-characterised -m "Pad v2 BO: T_max=85, T_min=37"
 git push --tags
 ```
