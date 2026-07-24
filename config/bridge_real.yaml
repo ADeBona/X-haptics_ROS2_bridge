@@ -1,0 +1,10 @@
+/kinova_haptic_bridge:
+  ros__parameters:
+    serial_port: "/dev/serial/by-id/usb-Arduino_UNO_WiFi_R4_CMSIS-DAP_F412FA654890-if01"
+    torque_axis: "y"
+    max_input: 6.0
+    max_pressure: 60.0
+    baseline_alpha: 0.995
+    engage_threshold: 0.30
+    release_threshold: 0.15
+    auto_recover: true

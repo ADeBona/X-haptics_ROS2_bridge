@@ -1,8 +1,12 @@
 /*
  * PURE DIGITAL PRESSURE TRACKER - NON-BLOCKING REVERSE-PFM
  * RL-optimised bounds: 6 ms burst, T_off 95 ms (low P) to 164 ms (high P).
- * Includes a command watchdog: if no serial command arrives within
- * COMMAND_TIMEOUT_MS, the target falls back to zero and the system vents.
+ *
+ * Safety features:
+ *   - Command watchdog: no serial command -> vent, then idle.
+ *   - Time-limited purge: the valve is never held open indefinitely.
+ *   - Valve thermal cap: hard limit on continuous energised time.
+ *   - Serial line timeout: a half-received command cannot wedge the parser.
  */
 
 const int SENSOR_PIN = A0;
@@ -12,34 +16,61 @@ const int VALVE_PIN  = 5;
 const float MAX_PRESSURE = 60.0;
 const float DEADBAND_KPA = 1.5;
 
-// Reverse-PFM parameters
+// ---- Reverse-PFM parameters ----
 const unsigned long BURST_MS = 6;     // minimum mechanical actuation time
 const int P_LOW  = 10;                // kPa, lower bound of the T_off map
 const int P_HIGH = 50;                // kPa, upper bound of the T_off map
 int settle_min = 95;                  // T_off at P_LOW
 int settle_max = 164;                 // T_off at P_HIGH
 
-// Safety watchdog
-const unsigned long COMMAND_TIMEOUT_MS = 3000;
+// ---- Purge (full vent) ----
+const unsigned long PURGE_MAX_MS   = 3000;  // never hold the valve open longer
+const float PURGE_DONE_KPA         = 1.0;   // below this, consider vented
+const float RE_PURGE_KPA           = 5.0;   // repressurised -> allow another purge
+
+// ---- Valve thermal protection (hard safety net) ----
+const unsigned long VALVE_MAX_ON_MS    = 5000;   // max continuous energised time
+const unsigned long VALVE_COOLDOWN_MS  = 10000;  // forced off period after that
+
+// ---- Command watchdog ----
+const unsigned long COMMAND_TIMEOUT_MS = 15000;
 unsigned long lastCommandTime = 0;
 bool watchdog_tripped = false;
+
+// ---- Serial line timeout ----
+const unsigned long SERIAL_LINE_TIMEOUT_MS = 500;
+unsigned long lastSerialByteTime = 0;
 
 float target_kPa = 0.0;
 float sensor_offset_kPa = 0.0;
 
-// PFM state machine
+// ---- PFM state ----
 bool valve_open = false;
 unsigned long pfm_timer = 0;
 unsigned long current_settle = 0;
+
+// ---- Purge state ----
+bool purging = false;
+bool purge_done = false;
+unsigned long purge_start = 0;
+
+// ---- Valve on-time tracking ----
+bool valve_energised = false;
+unsigned long valve_on_since = 0;
+bool valve_cooling = false;
+unsigned long cooldown_start = 0;
 
 unsigned long lastLogTime = 0;
 const int LOG_INTERVAL_MS = 50;
 
 char serialBuffer[32];
 int bufferIndex = 0;
+const char* state_name = "INIT";
 
 void calibrateSensorOffset();
 float convertADCToKPa(int adcValue);
+void setValve(bool on, unsigned long now);
+void setPump(bool on);
 
 void setup() {
   Serial.begin(115200);
@@ -49,6 +80,7 @@ void setup() {
   digitalWrite(VALVE_PIN, LOW);
   calibrateSensorOffset();
   lastCommandTime = millis();
+  lastSerialByteTime = millis();
 }
 
 void loop() {
@@ -57,6 +89,7 @@ void loop() {
   // ---- 1. SERIAL PARSING (non-blocking) ----
   while (Serial.available() > 0) {
     char c = Serial.read();
+    lastSerialByteTime = now;
     if (c == '\n' || c == '\r') {
       if (bufferIndex > 0) {
         serialBuffer[bufferIndex] = '\0';
@@ -65,7 +98,6 @@ void loop() {
           if (serialBuffer[i] == ',') commaCount++;
         }
         if (commaCount == 2) {
-          // "target,settle_max,settle_min" for live tuning
           char* t_str   = strtok(serialBuffer, ",");
           char* max_str = strtok(NULL, ",");
           char* min_str = strtok(NULL, ",");
@@ -90,13 +122,18 @@ void loop() {
     }
   }
 
+  // Discard a partial line left behind by a killed host process.
+  if (bufferIndex > 0 && (now - lastSerialByteTime) > SERIAL_LINE_TIMEOUT_MS) {
+    bufferIndex = 0;
+  }
+
   // ---- 2. WATCHDOG ----
-  // No command for COMMAND_TIMEOUT_MS means the host is gone, the USB cable
-  // was pulled, or the bridge crashed. Fail safe: vent to atmosphere.
   if (now - lastCommandTime > COMMAND_TIMEOUT_MS) {
     if (!watchdog_tripped) {
       Serial.println("WATCHDOG:timeout, venting");
       watchdog_tripped = true;
+      purge_done = false;      // allow one purge to vent safely
+      purging = false;
     }
     target_kPa = 0.0;
   }
@@ -106,47 +143,74 @@ void loop() {
   if (actual_kPa < 0.0) actual_kPa = 0.0;
   float error = target_kPa - actual_kPa;
 
-  // ---- 4. CLOSED-LOOP CONTROL ----
-  if (target_kPa <= 0.1 && actual_kPa < 2.0) {
-    // FULL EXHAUST: purge residual air without chattering
-    digitalWrite(PUMP_PIN, LOW);
-    digitalWrite(VALVE_PIN, HIGH);
+  // ---- 4. CONTROL ----
+  if (target_kPa <= 0.1) {
+    // Commanded to zero: vent once, then sit idle with nothing energised.
+    setPump(false);
     valve_open = false;
-  }
-  else if (error > DEADBAND_KPA) {
-    // INFLATE: continuous bang-bang
-    digitalWrite(VALVE_PIN, LOW);
-    digitalWrite(PUMP_PIN, HIGH);
-    valve_open = false;
-    pfm_timer = now;
-  }
-  else if (error < -DEADBAND_KPA) {
-    // DEFLATE: reverse-PFM, non-blocking
-    digitalWrite(PUMP_PIN, LOW);
 
-    if (valve_open) {
-      if (now - pfm_timer >= BURST_MS) {
-        digitalWrite(VALVE_PIN, LOW);
-        valve_open = false;
-        pfm_timer = now;
-        current_settle = constrain(
-            map((int)actual_kPa, P_LOW, P_HIGH, settle_min, settle_max),
-            settle_min, settle_max);
+    if (actual_kPa > RE_PURGE_KPA) purge_done = false;  // repressurised
+
+    if (!purge_done && actual_kPa > PURGE_DONE_KPA) {
+      if (!purging) { purging = true; purge_start = now; }
+      if (now - purge_start < PURGE_MAX_MS) {
+        setValve(true, now);
+        state_name = "PURGE";
+      } else {
+        purging = false;
+        purge_done = true;
+        setValve(false, now);
+        state_name = "IDLE";
       }
     } else {
-      if (now - pfm_timer >= current_settle) {
-        digitalWrite(VALVE_PIN, HIGH);
-        valve_open = true;
-        pfm_timer = now;
-      }
+      purging = false;
+      purge_done = true;
+      setValve(false, now);        // IDLE: coil de-energised, valve closed
+      state_name = "IDLE";
     }
   }
   else {
-    // HOLD
-    digitalWrite(PUMP_PIN, LOW);
-    digitalWrite(VALVE_PIN, LOW);
-    valve_open = false;
-    pfm_timer = now;
+    purging = false;
+    purge_done = false;
+
+    if (error > DEADBAND_KPA) {
+      // INFLATE
+      setValve(false, now);
+      setPump(true);
+      valve_open = false;
+      pfm_timer = now;
+      state_name = "INFLATE";
+    }
+    else if (error < -DEADBAND_KPA) {
+      // DEFLATE: reverse-PFM (low duty cycle, thermally safe)
+      setPump(false);
+      state_name = "DEFLATE";
+
+      if (valve_open) {
+        if (now - pfm_timer >= BURST_MS) {
+          setValve(false, now);
+          valve_open = false;
+          pfm_timer = now;
+          current_settle = constrain(
+              map((int)actual_kPa, P_LOW, P_HIGH, settle_min, settle_max),
+              settle_min, settle_max);
+        }
+      } else {
+        if (now - pfm_timer >= current_settle) {
+          setValve(true, now);
+          valve_open = true;
+          pfm_timer = now;
+        }
+      }
+    }
+    else {
+      // HOLD
+      setPump(false);
+      setValve(false, now);
+      valve_open = false;
+      pfm_timer = now;
+      state_name = "HOLD";
+    }
   }
 
   // ---- 5. TELEMETRY ----
@@ -154,9 +218,47 @@ void loop() {
     Serial.print("Target:");
     Serial.print(target_kPa);
     Serial.print(", Actual:");
-    Serial.println(actual_kPa);
+    Serial.print(actual_kPa);
+    Serial.print(", State:");
+    Serial.println(state_name);
     lastLogTime = now;
   }
+}
+
+// Valve driver with a hard cap on continuous energised time.
+// Even if the control logic misbehaves, the coil cannot be held on
+// longer than VALVE_MAX_ON_MS.
+void setValve(bool on, unsigned long now) {
+  if (valve_cooling) {
+    if (now - cooldown_start < VALVE_COOLDOWN_MS) {
+      digitalWrite(VALVE_PIN, LOW);
+      valve_energised = false;
+      return;
+    }
+    valve_cooling = false;
+  }
+
+  if (on) {
+    if (!valve_energised) {
+      valve_energised = true;
+      valve_on_since = now;
+    } else if (now - valve_on_since > VALVE_MAX_ON_MS) {
+      Serial.println("VALVE:thermal cap, forcing cooldown");
+      valve_cooling = true;
+      cooldown_start = now;
+      digitalWrite(VALVE_PIN, LOW);
+      valve_energised = false;
+      return;
+    }
+    digitalWrite(VALVE_PIN, HIGH);
+  } else {
+    digitalWrite(VALVE_PIN, LOW);
+    valve_energised = false;
+  }
+}
+
+void setPump(bool on) {
+  digitalWrite(PUMP_PIN, on ? HIGH : LOW);
 }
 
 void calibrateSensorOffset() {

@@ -29,7 +29,7 @@ class KinovaHapticBridgeSim(Node):
         self.declare_parameter('baud_rate', 115200)
         self.declare_parameter('sim_topic', '/kinova/sim_torque')
         self.declare_parameter('sim_max_torque', 5.0)
-        self.declare_parameter('max_pressure', 60.0)
+        self.declare_parameter('max_pressure', 50.0)
 
         p = self.get_parameter
         port = p('serial_port').value
