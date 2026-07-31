@@ -94,6 +94,8 @@ ros2 run kinova_haptic_teleop kinova_haptic_bridge --ros-args \
 
 Command line, for a one-off override:
 ```bash
+docker exec -it kinova_haptic_humble bash
+source install/setup.bash
 ros2 run kinova_haptic_teleop kinova_haptic_bridge --ros-args \
   -p serial_port:=/dev/serial/by-id/usb-Arduino_UNO_WiFi_R4_CMSIS-DAP_F412FA654890-if01 \
   -p torque_axis:="'y'" \

@@ -44,7 +44,7 @@ class KinovaHapticBridge(Node):
         self.declare_parameter('max_input', 6.0)           # torque at full scale (Nm)
         self.declare_parameter('max_pressure', 60.0)       # kPa at full scale
         self.declare_parameter('baseline_alpha', 0.995)    # closer to 1 = slower baseline
-        self.declare_parameter('engage_threshold', 0.30)   # Nm above baseline -> contact
+        self.declare_parameter('engage_threshold', 0.10)   # Nm above baseline -> contact
         self.declare_parameter('release_threshold', 0.15)  # Nm -> leave contact
         self.declare_parameter('auto_recover', True)
 
