@@ -1,9 +1,0 @@
-{
-  "T_max_ms": 198,
-  "T_min_ms": 100,
-  "mse": 1.2446809293996228,
-  "p_start_kPa": 30.0,
-  "p_end_kPa": 2.0,
-  "t_ref_ms": 2244.0,
-  "trials": 25
-}
