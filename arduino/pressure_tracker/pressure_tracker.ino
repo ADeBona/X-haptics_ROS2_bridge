@@ -20,8 +20,8 @@ const float DEADBAND_KPA = 1.5;
 const unsigned long BURST_MS = 6;     // minimum mechanical actuation time
 const int P_LOW  = 10;                // kPa, lower bound of the T_off map
 const int P_HIGH = 50;                // kPa, upper bound of the T_off map
-int settle_min = 95;                  // T_off at P_LOW
-int settle_max = 164;                 // T_off at P_HIGH
+int settle_min = 40;                  // T_off at P_LOW
+int settle_max = 80;                 // T_off at P_HIGH
 
 // ---- Purge (full vent) ----
 const unsigned long PURGE_MAX_MS   = 3000;  // never hold the valve open longer

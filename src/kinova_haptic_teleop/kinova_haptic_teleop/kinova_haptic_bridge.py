@@ -39,7 +39,7 @@ class KinovaHapticBridge(Node):
         self.declare_parameter('serial_port', '/dev/ttyACM0')
         self.declare_parameter('baud_rate', 115200)
         self.declare_parameter('usb_vendor_id', '2341')    # Arduino SA
-        self.declare_parameter('wrench_topic', '/ft_sensor_lin/wrench')
+        self.declare_parameter('wrench_topic', '/ft_sensor_link/wrench')
         self.declare_parameter('torque_axis', 'y')         # 'x' | 'y' | 'z'
         self.declare_parameter('max_input', 6.0)           # torque at full scale (Nm)
         self.declare_parameter('max_pressure', 60.0)       # kPa at full scale
