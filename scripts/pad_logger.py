@@ -12,12 +12,41 @@ import argparse
 import csv
 import os
 import select
+import subprocess
 import sys
 import termios
 import time
 import tty
 
 import serial
+
+
+def check_port_free(port):
+    """Refuse to proceed if another process already holds the port.
+
+    Two opens of the same tty both succeed silently on Linux unless the
+    holder set TIOCEXCL, so a stuck bridge process otherwise looks just
+    like a normal connection - commands land nowhere and nothing inflates.
+    Tries sudo -n first since the bridge usually runs as root and a plain
+    lsof can't see another user's open fds; falls back to a plain lsof
+    (still catches a same-user holder) if sudo isn't cached.
+    """
+    for cmd in (['sudo', '-n', 'lsof', port], ['lsof', port]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+        except FileNotFoundError:
+            continue
+        lines = [l for l in out.stdout.splitlines() if l and not l.startswith('COMMAND')]
+        if lines:
+            print(f'\n{port} is already open by another process:')
+            for l in lines:
+                print(f'  {l}')
+            print('\nMost likely the ROS bridge (kinova_haptic_bridge) is still running.')
+            print('Stop it first (GUIDE.md §12), e.g.:')
+            print('  sudo kill -INT <PID>')
+            sys.exit(1)
+        if out.returncode == 0:
+            return  # authoritative "nothing has it open" - no need to try sudo
 
 
 class PadRig:
@@ -153,11 +182,18 @@ def manual_stepping(rig):
             sys.stdout.flush()
             if select.select([fd], [], [], 0.05)[0]:
                 data = os.read(fd, 8)
-                if data.startswith(b'\x1b['):
-                    if data[2:3] == b'A':
-                        rig.send('U')
-                    elif data[2:3] == b'B':
-                        rig.send('D')
+                if data.startswith(b'\x1b'):
+                    # over SSH the escape sequence can arrive split across
+                    # reads; give it a moment to complete
+                    while len(data) < 3 and select.select([fd], [], [], 0.05)[0]:
+                        data += os.read(fd, 8)
+                    # CSI (ESC [ A/B) or SS3 (ESC O A/B, application cursor
+                    # key mode) - terminals vary in which they send
+                    if data[1:2] in (b'[', b'O'):
+                        if data[2:3] == b'A':
+                            rig.send('U')
+                        elif data[2:3] == b'B':
+                            rig.send('D')
                 elif data in (b'z', b'Z'):
                     rig.send('Z')
                 elif data in (b'q', b'\x03'):
@@ -179,6 +215,7 @@ def main():
     args = ap.parse_args()
     outdir = os.path.abspath(args.out)
 
+    check_port_free(args.port)
     rig = PadRig(args.port)
     try:
         while True:

@@ -59,6 +59,15 @@ bool valve_cooling = false;
 unsigned long cooldown_start = 0;
 unsigned long valve_close_time = 0;
 
+// ---- Free venting (PH_VENT, manual vent-to-zero) ----
+// settled_kPa only updates while the valve is shut, so venting has to be
+// duty-cycled rather than held open solid, or the reading freezes and the
+// vent can only ever end via the thermal cap forcing the valve shut.
+const unsigned long VENT_OPEN_MS   = 400;  // burst-open duration while purging
+const unsigned long VENT_SAMPLE_MS = 120;  // closed window to get a clean read
+bool vent_open = true;
+unsigned long vent_timer = 0;
+
 float settled_kPa = 0.0;               // the trusted pressure reading
 
 // ---- Modes ----
@@ -214,6 +223,7 @@ void handleCommand(unsigned long now) {
       test_target = constrain(atof(t), 0.0, HARD_CEILING_KPA);
       mode = M_INFLATE_TEST; phase = PH_VENT;
       phase_start = now; log_interval_ms = 20;
+      vent_open = true; vent_timer = now;
       Serial.print("EVT,inflation test to "); Serial.println(test_target);
     }
   }
@@ -229,6 +239,7 @@ void handleCommand(unsigned long now) {
       mode = M_DEFLATE_TEST; phase = PH_VENT;
       reached_target = false;
       phase_start = now; log_interval_ms = 20;
+      vent_open = true; vent_timer = now;
       Serial.print("EVT,deflation test "); Serial.print(test_target);
       Serial.print(" Tmax="); Serial.print(settle_max);
       Serial.print(" Tmin="); Serial.println(settle_min);
@@ -276,7 +287,14 @@ void loop() {
   if (mode == M_INFLATE_TEST) {
 
     if (phase == PH_VENT) {
-      setPump(false); setValve(true, now);
+      setPump(false);
+      if (vent_open) {
+        setValve(true, now);
+        if (now - vent_timer >= VENT_OPEN_MS) { vent_open = false; vent_timer = now; }
+      } else {
+        setValve(false, now);
+        if (now - vent_timer >= VENT_SAMPLE_MS) { vent_open = true; vent_timer = now; }
+      }
       if (settled_kPa < 1.0 || now - phase_start > 8000) {
         setValve(false, now);
         phase = PH_SETTLE; phase_start = now;
@@ -303,7 +321,14 @@ void loop() {
   else if (mode == M_DEFLATE_TEST) {
 
     if (phase == PH_VENT) {
-      setPump(false); setValve(true, now);
+      setPump(false);
+      if (vent_open) {
+        setValve(true, now);
+        if (now - vent_timer >= VENT_OPEN_MS) { vent_open = false; vent_timer = now; }
+      } else {
+        setValve(false, now);
+        if (now - vent_timer >= VENT_SAMPLE_MS) { vent_open = true; vent_timer = now; }
+      }
       if (settled_kPa < 1.0 || now - phase_start > 8000) {
         setValve(false, now);
         phase = PH_SETTLE; phase_start = now;
@@ -377,7 +402,18 @@ void loop() {
 
     if (target_kPa <= 0.1) {
       setPump(false);
-      if (settled_kPa > 1.0) setValve(true, now); else setValve(false, now);
+      if (settled_kPa > 1.0) {
+        if (vent_open) {
+          setValve(true, now);
+          if (now - vent_timer >= VENT_OPEN_MS) { vent_open = false; vent_timer = now; }
+        } else {
+          setValve(false, now);
+          if (now - vent_timer >= VENT_SAMPLE_MS) { vent_open = true; vent_timer = now; }
+        }
+      } else {
+        setValve(false, now);
+        vent_open = true; vent_timer = now;   // start open again next time
+      }
       valve_open = false; pfm_timer = now;
     }
     else if (error > DEADBAND_KPA) {
