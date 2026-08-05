@@ -247,7 +247,9 @@ tail -f /repo/logs/kinova_haptic_bridge_log.csv
 ## 6. Confirming the axis and taring
 
 The sensor axis mapping (`axis_vertical`, `axis_lateral`, `lever_sign`) is
-**not confirmed** — determine it empirically, then tare:
+**not confirmed** — determine it empirically, then tare. For the detailed,
+one-motion-at-a-time walkthrough with what to watch for at each step, see
+[`AXIS_CALIBRATION.md`](AXIS_CALIBRATION.md). Short version:
 
 1. Start the bridge with the arm at rest, not touching anything. Trigger a
    tare so the frozen offset is captured against the true at-rest reading:
