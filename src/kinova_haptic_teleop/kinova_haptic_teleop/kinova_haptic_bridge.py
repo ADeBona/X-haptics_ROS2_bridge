@@ -2,10 +2,15 @@
 """
 REAL-robot bridge for the chi-Haptics interface.
 
-Subscribes to a geometry_msgs/WrenchStamped F/T topic and renders only the
-INTERACTION torque via gated-tare: the baseline (gravity / pose / mounting
-offset) adapts ONLY when out of contact and freezes during a push, so a
-sustained contact is rendered at true magnitude for its whole duration.
+Subscribes to a geometry_msgs/WrenchStamped F/T topic and renders the screw
+torque about the bolt axis (see screw_torque.py for the physics) as pad
+pressure, at a fixed 20 Hz over USB serial to an Arduino.
+
+Only one pneumatic channel exists today (one pump, one valve, one sensor,
+inflating a fixed pair of pads together), so only group_A - the tightening
+direction - is actually sent over serial. group_B is computed and logged for
+validation and is ready to be wired to a second channel later; nothing about
+the mapping needs to change when that hardware arrives.
 
 Includes automatic USB recovery. The UNO R4's native USB CDC endpoint can
 stall under sustained traffic while the device remains enumerated; an MCU
@@ -16,12 +21,18 @@ import fcntl
 import os
 import threading
 import time
+from collections import namedtuple
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Empty
 from geometry_msgs.msg import WrenchStamped
 import serial
+
+from kinova_haptic_teleop.screw_torque import (
+    compute_screw_torque, compute_u, compute_pad_pressures, TareEstimator,
+)
+from kinova_haptic_teleop.pad_csv_logger import ScrewTorqueCsvLogger
 
 KEEPALIVE_PERIOD_S = 1.0
 OUTPUT_PERIOD_S = 0.05          # 20 Hz to the Arduino
@@ -29,6 +40,9 @@ SUPERVISE_PERIOD_S = 1.0
 STALL_TIMEOUT_S = 3.0           # no telemetry for this long -> recover
 
 USBDEVFS_RESET = (ord('U') << 8) | 20    # _IO('U', 20)
+
+Sample = namedtuple('Sample', [
+    'force', 'torque', 'tau_raw', 'tau_screw', 'tau_perp_mag', 'u', 'pA', 'pB'])
 
 
 class KinovaHapticBridge(Node):
@@ -40,47 +54,73 @@ class KinovaHapticBridge(Node):
         self.declare_parameter('baud_rate', 115200)
         self.declare_parameter('usb_vendor_id', '2341')    # Arduino SA
         self.declare_parameter('wrench_topic', '/ft_sensor_link/wrench')
-        self.declare_parameter('torque_axis', 'y')         # 'x' | 'y' | 'z'
-        self.declare_parameter('max_input', 6.0)           # torque at full scale (Nm)
-        self.declare_parameter('max_pressure', 60.0)       # kPa at full scale
-        self.declare_parameter('baseline_alpha', 0.995)    # closer to 1 = slower baseline
-        self.declare_parameter('engage_threshold', 0.10)   # Nm above baseline -> contact
-        self.declare_parameter('release_threshold', 0.15)  # Nm -> leave contact
         self.declare_parameter('auto_recover', True)
+
+        # Screw-torque extraction (see screw_torque.py). Which sensor axis is
+        # vertical/lateral is not yet confirmed - tune empirically.
+        self.declare_parameter('axis_vertical', 2)         # index into torque.{x,y,z}
+        self.declare_parameter('axis_lateral', 0)          # index into force.{x,y,z}
+        self.declare_parameter('lever_L', 0.20)             # metres
+        self.declare_parameter('lever_sign', 1)             # +1 or -1
+
+        # Pad mapping
+        self.declare_parameter('tau_deadband', 0.05)        # Nm
+        self.declare_parameter('tau_max', 2.0)              # Nm
+        self.declare_parameter('pressure_bias', 0.0)        # kPa (serial protocol units)
+        self.declare_parameter('pressure_span', 40.0)       # kPa
+
+        # Tare
+        self.declare_parameter('tare_samples', 20)
+
+        # Logging
+        self.declare_parameter('csv_log_path', 'kinova_haptic_bridge_log.csv')
 
         p = self.get_parameter
         self.port = p('serial_port').value
         self.baud = p('baud_rate').value
         self.usb_vendor = p('usb_vendor_id').value
         self.topic = p('wrench_topic').value
-        self.axis = p('torque_axis').value
-        self.max_input = float(p('max_input').value)
-        self.max_pressure = float(p('max_pressure').value)
-        self.alpha = float(p('baseline_alpha').value)
-        self.engage = float(p('engage_threshold').value)
-        self.release = float(p('release_threshold').value)
         self.auto_recover = bool(p('auto_recover').value)
+
+        self.axis_vertical = int(p('axis_vertical').value)
+        self.axis_lateral = int(p('axis_lateral').value)
+        self.lever_L = float(p('lever_L').value)
+        self.lever_sign = int(p('lever_sign').value)
+
+        self.tau_deadband = float(p('tau_deadband').value)
+        self.tau_max = float(p('tau_max').value)
+        self.pressure_bias = float(p('pressure_bias').value)
+        self.pressure_span = float(p('pressure_span').value)
+
+        self.tare_samples = int(p('tare_samples').value)
+        self.csv_log_path = p('csv_log_path').value
 
         # --- state ---
         self.ser = None
         self.connected = False
         self.recovering = False
-        self.pending_pressure = 0.0
         self.last_sent = None
         self.last_telemetry = time.time()
         self.write_lock = threading.Lock()
         self.recovery_lock = threading.Lock()
-        self.baseline = None
-        self.in_contact = False
+
+        self.tare = TareEstimator(self.tare_samples)
+        self.latest = None   # Sample, set by on_wrench once data has arrived
+        self.csv_logger = ScrewTorqueCsvLogger(self.csv_log_path)
 
         self._open_serial()
 
         self.actual_pub = self.create_publisher(Float32, '/pressure/actual_kpa', 10)
         self.echo_pub = self.create_publisher(Float32, '/pressure/target_kpa_echo', 10)
         self.create_subscription(WrenchStamped, self.topic, self.on_wrench, 10)
+        self.create_subscription(Empty, '~/tare', self.on_tare, 10)
+        self.create_subscription(Empty, '~/reset_tare', self.on_reset_tare, 10)
         self.get_logger().info(
-            f'REAL mode: {self.topic}, axis={self.axis}, max_input={self.max_input} Nm, '
-            f'engage={self.engage}, release={self.release}, auto_recover={self.auto_recover}')
+            f'REAL mode: {self.topic}, axis_vertical={self.axis_vertical}, '
+            f'axis_lateral={self.axis_lateral}, lever_L={self.lever_L}, '
+            f'lever_sign={self.lever_sign}, tau_deadband={self.tau_deadband}, '
+            f'tau_max={self.tau_max}, auto_recover={self.auto_recover}, '
+            f'csv_log_path={self.csv_log_path}')
 
         self.create_timer(OUTPUT_PERIOD_S, self.push_to_arduino)
         self.create_timer(KEEPALIVE_PERIOD_S, self.keepalive)
@@ -207,34 +247,52 @@ class KinovaHapticBridge(Node):
     # ---------------- input (compute only) ----------------
 
     def on_wrench(self, msg: WrenchStamped):
-        raw = getattr(msg.wrench.torque, self.axis)
+        force = (msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z)
+        torque = (msg.wrench.torque.x, msg.wrench.torque.y, msg.wrench.torque.z)
 
-        if self.baseline is None:
-            self.baseline = raw
+        st = compute_screw_torque(
+            torque, force, self.axis_vertical, self.axis_lateral,
+            self.lever_L, self.lever_sign)
 
-        mag = abs(raw - self.baseline)
+        if self.tare.feed(st.tau_screw):
+            self.get_logger().info(f'Tare captured: offset={self.tare.offset:.4f} Nm')
 
-        if mag > self.engage:
-            self.in_contact = True
-        elif mag < self.release:
-            self.in_contact = False
+        tau_tared = self.tare.apply(st.tau_screw)
+        u = compute_u(tau_tared, self.tau_deadband, self.tau_max)
+        pA, pB = compute_pad_pressures(u, self.pressure_bias, self.pressure_span)
 
-        # Adapt baseline only out of contact; freeze during a push.
-        if not self.in_contact:
-            self.baseline = self.alpha * self.baseline + (1.0 - self.alpha) * raw
+        self.latest = Sample(
+            force=force, torque=torque, tau_raw=st.tau_raw, tau_screw=st.tau_screw,
+            tau_perp_mag=st.tau_perp_mag, u=u, pA=pA, pB=pB)
 
-        interaction = mag if self.in_contact else 0.0
-        self.pending_pressure = min(
-            interaction / self.max_input * self.max_pressure, self.max_pressure)
+    def on_tare(self, _msg: Empty):
+        self.tare.start_tare()
+        self.get_logger().info(f'Tare requested: averaging next {self.tare_samples} samples')
+
+    def on_reset_tare(self, _msg: Empty):
+        self.tare.reset()
+        self.get_logger().info('Tare offset reset to 0')
 
     # ---------------- fixed-rate writer ----------------
 
     def push_to_arduino(self):
-        command = f'{self.pending_pressure:.2f}'
-        if command == self.last_sent:
+        s = self.latest
+        if s is None:
             return
-        self.last_sent = command
-        self.send(command)
+
+        # Only group_A is wired to hardware today (one channel = the
+        # tightening direction). group_B is logged for validation only.
+        command = f'{s.pA:.2f}'
+        if command != self.last_sent:
+            self.last_sent = command
+            self.send(command)
+
+        fx, fy, fz = s.force
+        tx, ty, tz = s.torque
+        self.csv_logger.write_row(
+            t=time.time(), force_xyz=(fx, fy, fz), torque_xyz=(tx, ty, tz),
+            tau_raw=s.tau_raw, tau_screw=s.tau_screw, tau_perp_mag=s.tau_perp_mag,
+            u=s.u, pA=s.pA, pB=s.pB)
 
     def keepalive(self):
         self.send(self.last_sent if self.last_sent is not None else '0.00',
@@ -291,6 +349,7 @@ class KinovaHapticBridge(Node):
             except Exception:
                 pass
             self.ser.close()
+        self.csv_logger.close()
         super().destroy_node()
 
 

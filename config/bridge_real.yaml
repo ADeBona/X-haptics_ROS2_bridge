@@ -1,10 +1,26 @@
 /kinova_haptic_bridge:
   ros__parameters:
     serial_port: "/dev/serial/by-id/usb-Arduino_UNO_WiFi_R4_CMSIS-DAP_F412FA654890-if01"
-    torque_axis: "y"
-    max_input: 3.0
-    max_pressure: 60.0
-    baseline_alpha: 0.999
-    engage_threshold: 0.1
-    release_threshold: 0.1
     auto_recover: true
+
+    # Screw-torque extraction (screw_torque.py). Not yet confirmed empirically -
+    # push the nut driver by hand, watch tau_raw/tau_screw/tau_perp_mag in the
+    # CSV log, and adjust until tau_perp_mag stays small and tau_screw tracks
+    # the applied twist cleanly.
+    axis_vertical: 2
+    axis_lateral: 0
+    lever_L: 0.20
+    lever_sign: 1
+
+    # Pad mapping
+    tau_deadband: 0.05
+    tau_max: 2.0
+    pressure_bias: 0.0
+    pressure_span: 40.0
+
+    # Tare (~/tare, ~/reset_tare)
+    tare_samples: 20
+
+    # Validation log - under /repo so it lands on the host Pi, not just the
+    # container's writable layer (see docker/docker-compose.yml's `/repo` mount)
+    csv_log_path: "/repo/logs/kinova_haptic_bridge_log.csv"

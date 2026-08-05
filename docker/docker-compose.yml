@@ -7,7 +7,8 @@ services:
     network_mode: host
     privileged: true
     volumes:
-      - ../src:/ros2_ws/src
+      - ..:/repo                # whole project, host-backed - nothing here lives only in the container
+      - ../src:/ros2_ws/src      # ROS workspace source (colcon build target, unchanged path)
       - ../config:/config:ro
       - /dev:/dev
     environment:
