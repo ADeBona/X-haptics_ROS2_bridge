@@ -2,13 +2,17 @@
 <CycloneDDS xmlns="https://cdds.io/config">
     <Domain id="any">
         <General>
+            <Interfaces>
+                <NetworkInterface name="eth0" />
+            </Interfaces>
             <AllowMulticast>false</AllowMulticast>
         </General>
         <Discovery>
+            <ParticipantIndex>auto</ParticipantIndex>
             <Peers>
-                <Peer address="localhost"/>      <!-- same-machine nodes -->
-                <Peer address="10.186.85.98"/>   <!-- robot PC (TU lab) -->
-                <Peer address="10.42.0.232"/>   <!-- this Pi on TU lab -->
+                <Peer address="localhost"/>       <!-- same-machine nodes -->
+                <Peer address="128.131.188.28"/>  <!-- robot PC (TU lab) -->
+                <Peer address="128.131.188.34"/>  <!-- this Pi on TU lab -->
             </Peers>
         </Discovery>
     </Domain>
