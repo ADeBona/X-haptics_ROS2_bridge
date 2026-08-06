@@ -7,10 +7,12 @@
     # push the nut driver by hand, watch tau_raw/tau_screw/tau_perp_mag in the
     # CSV log, and adjust until tau_perp_mag stays small and tau_screw tracks
     # the applied twist cleanly.
-    axis_vertical: 1
-    axis_lateral: 2
+    axis_vertical: 0
+    axis_lateral: 1
     lever_L: 0.15
     lever_sign: 1
+    tighten_sign: 1   # TODO confirm: +1 keeps tightening reading positive as-is,
+                       # -1 flips it. See rows 339-377 vs 229-255 in the CSV log.
 
     # Pad mapping
     tau_deadband: 0.05

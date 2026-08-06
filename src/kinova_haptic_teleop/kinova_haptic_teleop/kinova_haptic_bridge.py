@@ -61,7 +61,8 @@ class KinovaHapticBridge(Node):
         self.declare_parameter('axis_vertical', 2)         # index into torque.{x,y,z}
         self.declare_parameter('axis_lateral', 0)          # index into force.{x,y,z}
         self.declare_parameter('lever_L', 0.20)             # metres
-        self.declare_parameter('lever_sign', 1)             # +1 or -1
+        self.declare_parameter('lever_sign', 1)             # +1 or -1, tunes lever-arm cancellation only
+        self.declare_parameter('tighten_sign', 1)           # +1 or -1, flips which twist direction is "tightening" - see AXIS_CALIBRATION.md
 
         # Pad mapping
         self.declare_parameter('tau_deadband', 0.05)        # Nm
@@ -86,6 +87,7 @@ class KinovaHapticBridge(Node):
         self.axis_lateral = int(p('axis_lateral').value)
         self.lever_L = float(p('lever_L').value)
         self.lever_sign = int(p('lever_sign').value)
+        self.tighten_sign = int(p('tighten_sign').value)
 
         self.tau_deadband = float(p('tau_deadband').value)
         self.tau_max = float(p('tau_max').value)
@@ -118,7 +120,8 @@ class KinovaHapticBridge(Node):
         self.get_logger().info(
             f'REAL mode: {self.topic}, axis_vertical={self.axis_vertical}, '
             f'axis_lateral={self.axis_lateral}, lever_L={self.lever_L}, '
-            f'lever_sign={self.lever_sign}, tau_deadband={self.tau_deadband}, '
+            f'lever_sign={self.lever_sign}, tighten_sign={self.tighten_sign}, '
+            f'tau_deadband={self.tau_deadband}, '
             f'tau_max={self.tau_max}, auto_recover={self.auto_recover}, '
             f'csv_log_path={self.csv_log_path}')
 
@@ -257,7 +260,13 @@ class KinovaHapticBridge(Node):
         if self.tare.feed(st.tau_screw):
             self.get_logger().info(f'Tare captured: offset={self.tare.offset:.4f} Nm')
 
-        tau_tared = self.tare.apply(st.tau_screw)
+        # tighten_sign is applied last, after tare - it only decides which
+        # physical twist direction counts as "tightening" (see
+        # AXIS_CALIBRATION.md's open question). It must never be folded into
+        # lever_sign: that one exists solely to cancel the false twist a
+        # sideways push produces, and flipping it for this instead breaks
+        # that cancellation.
+        tau_tared = self.tighten_sign * self.tare.apply(st.tau_screw)
         u = compute_u(tau_tared, self.tau_deadband, self.tau_max)
         pA, pB = compute_pad_pressures(u, self.pressure_bias, self.pressure_span)
 
