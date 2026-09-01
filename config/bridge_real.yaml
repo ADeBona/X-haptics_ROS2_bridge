@@ -10,15 +10,14 @@
     axis_vertical: 0
     axis_lateral: 1
     lever_L: 0.15
-    lever_sign: -1
-    tighten_sign: 1   # TODO confirm: +1 keeps tightening reading positive as-is,
-                       # -1 flips it. See rows 339-377 vs 229-255 in the CSV log.
+    lever_sign: 1 
+    tighten_sign: -1   # TODO confirm: +1 keeps tightening reading positive as-is,
 
     # Pad mapping
     tau_deadband: 0.05
-    tau_max: 5.0
+    tau_max: 4.0
     pressure_bias: 0.0
-    pressure_span: 40.0
+    pressure_span: 60.0
 
     # Tare (~/tare, ~/reset_tare)
     tare_samples: 20
