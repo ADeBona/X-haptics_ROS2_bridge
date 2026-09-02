@@ -4,3 +4,4 @@ log/
 __pycache__/
 *.pyc
 *.save
+logs/kinova_haptic_bridge_log.csv
