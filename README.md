@@ -22,6 +22,7 @@ deflation strategy that approximates proportional control using binary valves.
 7. [Building & Running](#7-building--running)
 8. [Connecting to a Real Robot](#8-connecting-to-a-real-robot)
 9. [Troubleshooting](#9-troubleshooting)
+10. [Measuring Command Latency](#10-measuring-command-latency)
 
 ---
 
@@ -701,13 +702,126 @@ docker logs kinova_haptic_humble
 
 ---
 
+## 10. Measuring Command Latency
+
+How long is it from a torque reading landing on the Pi to the pump actually
+switching on? `test/latency_probe.py` answers that, broken down per step.
+
+It is **standalone**. It does not import, modify or wrap `kinova_haptic_bridge.py`,
+and it needs no `colcon build` - `setup.py` excludes `test/` from the install, so
+you run it by path. The only thing it shares with the bridge is `screw_torque.py`,
+imported read-only so the mapping under test cannot drift from production.
+
+### What it measures
+
+| # | Stage | Meaning |
+|---|-------|---------|
+| 1 | `sensor_to_host` | FT `header.stamp` → wrench callback entry |
+| 2 | `compute` | screw-torque + pad mapping arithmetic |
+| 3 | `queue_wait` | wrench received → serial write begins **(the dominant term)** |
+| 4 | `serial_write` | `ser.write()` + `flush()` duration |
+| 5 | `host_total` | wrench received → command bytes flushed (3 + 4) |
+| 6 | `link_ack_rtt` | bytes flushed → Arduino acknowledged the command |
+| 7 | `link_oneway_est` | estimated one-way host→MCU (half of 6) |
+| 8 | `cmd_to_inflate` | bytes flushed → Arduino entered `INFLATE` |
+| 9 | `end_to_end` | wrench received → `INFLATE` (5 + 8) |
+| 10 | `pneumatic_dead` | `INFLATE` → first measurable pressure rise |
+
+Stages 1-5 are exact: both endpoints are timestamps on the probe's own monotonic
+clock. Stage 10 is the pump, tubing and pad volume - it is reported but
+deliberately **excluded** from the latency budget, because it is the actuator
+doing its job rather than a control-path delay.
+
+Stage 3 is the one worth looking at. `push_to_arduino` runs on its own 20 Hz
+timer, unsynchronised with `on_wrench`, so a fresh reading waits a uniform
+0-50 ms before it reaches the wire.
+
+### Modes
+
+**`--mode stimulus`** — no ROS, no robot, no wrench topic. Plain `python3` +
+`pyserial`. Drives a square wave and measures the link, the MCU and the
+pneumatic dead time in isolation. The cleanest, most repeatable answer to
+"how long from command to the start of the action". **Stop the bridge first.**
+
+```bash
+python3 src/kinova_haptic_teleop/test/latency_probe.py --mode stimulus \
+    --serial-port /dev/ttyACM0 --stim-high 30 --stim-period 4
+```
+
+**`--mode live`** (default) — an instrumented twin of the bridge: same 20 Hz
+timer, same 2-decimal dedup, same serial framing, driving the real hardware
+from the real wrench topic. Full chain under real conditions.
+**Stop the bridge first** - two processes cannot own the serial port.
+
+```bash
+docker exec -it kinova_haptic_humble bash
+source install/setup.bash
+python3 /repo/src/kinova_haptic_teleop/test/latency_probe.py --mode live \
+    --params /config/bridge_real.yaml
+```
+
+You must actually apply torque during the run. If nothing moves, `pA` never
+changes at 2 decimals, the dedup suppresses every write, and there is nothing
+to measure - the report will say so.
+
+**`--mode passive`** — opens no serial port, publishes nothing, and observes a
+**running** bridge over its own topics. Safe mid-experiment, but it only sees
+stage 1 and a coarse end-to-end round trip; everything else happens inside the
+bridge process where it cannot reach.
+
+```bash
+python3 /repo/src/kinova_haptic_teleop/test/latency_probe.py --mode passive
+```
+
+### Output
+
+Stop with **Ctrl+C**. The probe prints a per-stage table (n / mean / p50 / p95 /
+max / min, in milliseconds), a "where the time goes" budget with percentages,
+and interpretation notes. Two files land in `--out-dir` (default `/repo/logs`):
+
+- `latency_<mode>_<timestamp>_events.csv` — one row per command, every stage in ms
+- `latency_<mode>_<timestamp>_report.txt` — a copy of the printed report
+
+Numbers backed by fewer than 20 samples are printed but flagged rather than
+interpreted.
+
+### Firmware precision
+
+With the **stock** `pressure_tracker.ino` the Arduino only speaks every
+`LOG_INTERVAL_MS` (50 ms), so stages 6-9 are quantised to 50 ms and biased high
+by ~25 ms on average. Usable as an upper bound, not a precise figure.
+
+For millisecond accuracy, flash the optional
+`arduino/pressure_tracker_latency/` build. It is a generated copy of the stock
+sketch whose only changes are two immediate event lines - `EVT:ACK` when a
+command parses, `EVT:INFLATE` on entry into `INFLATE` - plus the `prev_state`
+variable that detects the transition. No control law, timing constant or safety
+limit is altered. The probe auto-detects it; there is no flag to pass.
+
+Reflash the stock sketch for real runs. The `EVT:` lines are harmless to the
+bridge (`parse_telemetry()` rejects them), but keep one firmware in service.
+
+### Caveats
+
+- `link_oneway_est` halves the round trip, which assumes a symmetric USB CDC
+  path. Good to a millisecond or two. For ground truth, toggle a spare Pi GPIO
+  immediately before `ser.write` and probe it against Arduino pin 3 on a
+  two-channel scope.
+- `sensor_to_host` compares a ROS stamp against this host's wall clock. It is
+  only meaningful if the FT publisher runs on this Pi, or if the clocks are
+  disciplined (PTP/chrony). The probe warns when the difference goes negative.
+
+---
+
 ## Repository Layout
 
 ```
 kinova_haptic_ws/
 ├── arduino/
-│   └── pressure_tracker/
-│       └── pressure_tracker.ino
+│   ├── pressure_tracker/
+│   │   └── pressure_tracker.ino
+│   └── pressure_tracker_latency/          # optional, measurement only
+│       └── pressure_tracker_latency.ino
 ├── config/
 │   └── cyclonedds.xml
 ├── docker/
@@ -718,10 +832,13 @@ kinova_haptic_ws/
 │       ├── package.xml
 │       ├── setup.py
 │       ├── resource/kinova_haptic_teleop
-│       └── kinova_haptic_teleop/
-│           ├── __init__.py
-│           ├── fake_torque_pub.py
-│           └── kinova_haptic_bridge.py
+│       ├── kinova_haptic_teleop/
+│       │   ├── __init__.py
+│       │   ├── fake_torque_pub.py
+│       │   └── kinova_haptic_bridge.py
+│       └── test/
+│           ├── test_screw_torque.py
+│           └── latency_probe.py           # standalone, not installed
 ├── .gitignore
 └── README.md
 ```
