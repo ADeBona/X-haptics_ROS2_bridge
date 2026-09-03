@@ -4,13 +4,28 @@ REAL-robot bridge for the chi-Haptics interface.
 
 Subscribes to a geometry_msgs/WrenchStamped F/T topic and renders the screw
 torque about the bolt axis (see screw_torque.py for the physics) as pad
-pressure, at a fixed 20 Hz over USB serial to an Arduino.
+pressure, at a fixed 20 Hz over USB serial to an Arduino. Wrench processing
+is decimated to that same 20 Hz regardless of the sensor's own publish rate
+- see WRENCH_PROCESS_PERIOD_S.
 
 Only one pneumatic channel exists today (one pump, one valve, one sensor,
 inflating a fixed pair of pads together), so only group_A - the tightening
 direction - is actually sent over serial. group_B is computed and logged for
 validation and is ready to be wired to a second channel later; nothing about
 the mapping needs to change when that hardware arrives.
+
+Published topics (all of it recordable into a rosbag on this side):
+    /pressure/actual_kpa      std_msgs/Float32       measured pad pressure
+    /pressure/target_kpa_echo std_msgs/Float32       target as the Arduino sees it
+    /haptic/screw_torque      geometry_msgs/Vector3Stamped
+                              (tau_raw, tau_screw, tau_tared) - the screw-axis
+                              component extracted from the full F/T wrench
+    /haptic/pad_target_kpa    geometry_msgs/Vector3Stamped
+                              (pA, pB, unused) - what the mapping commands
+
+The two Vector3Stamped topics carry the header stamp of the F/T sample they
+were derived from, so in a bag they align with the source wrench rather than
+with the moment this node got round to publishing them.
 
 Includes automatic USB recovery. The UNO R4's native USB CDC endpoint can
 stall under sustained traffic while the device remains enumerated; an MCU
@@ -26,7 +41,7 @@ from collections import namedtuple
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32, Empty
-from geometry_msgs.msg import WrenchStamped
+from geometry_msgs.msg import WrenchStamped, Vector3Stamped
 import serial
 
 from kinova_haptic_teleop.screw_torque import (
@@ -39,10 +54,28 @@ OUTPUT_PERIOD_S = 0.05          # 20 Hz to the Arduino
 SUPERVISE_PERIOD_S = 1.0
 STALL_TIMEOUT_S = 3.0           # no telemetry for this long -> recover
 
+# Some F/T sensors stream at 500 Hz-1 kHz regardless of what the robot is
+# doing. Running the full extraction (and publishing /haptic/screw_torque)
+# on every single sample buys nothing - push_to_arduino only ever acts at
+# OUTPUT_PERIOD_S - but it does cost real CPU/GIL time in rclpy's per-message
+# Python dispatch. At sustained 1 kHz that was enough to starve this node's
+# own 1 Hz supervise() timer, which is what notices a stalled USB link and
+# recovers it; with supervise() starved, a stall that would normally
+# self-heal in ~3 s instead sits dead until someone restarts the node. Gate
+# on_wrench to the same cadence we actually act on to keep that headroom.
+WRENCH_PROCESS_PERIOD_S = OUTPUT_PERIOD_S
+
 USBDEVFS_RESET = (ord('U') << 8) | 20    # _IO('U', 20)
 
 Sample = namedtuple('Sample', [
-    'force', 'torque', 'tau_raw', 'tau_screw', 'tau_perp_mag', 'u', 'pA', 'pB'])
+    'stamp', 'force', 'torque', 'tau_raw', 'tau_screw', 'tau_tared',
+    'tau_perp_mag', 'u', 'pA', 'pB'])
+
+# Vector3Stamped has no field names of its own, so the meaning of x/y/z on
+# the two derived topics is fixed here and documented in README.md. Do not
+# reorder these: a recorded bag is only interpretable through this mapping.
+TORQUE_FIELDS = ('tau_raw', 'tau_screw', 'tau_tared')   # /haptic/screw_torque
+PAD_FIELDS = ('pA', 'pB', 'unused')                     # /haptic/pad_target_kpa
 
 
 class KinovaHapticBridge(Node):
@@ -76,6 +109,12 @@ class KinovaHapticBridge(Node):
         # Logging
         self.declare_parameter('csv_log_path', 'kinova_haptic_bridge_log.csv')
 
+        # frame_id stamped on the derived Vector3Stamped topics. Empty by
+        # default and deliberately so: x/y/z there are three packed scalars
+        # (see TORQUE_FIELDS / PAD_FIELDS), not a geometric vector, so naming
+        # a real frame would invite a TF transform that means nothing.
+        self.declare_parameter('derived_frame_id', '')
+
         p = self.get_parameter
         self.port = p('serial_port').value
         self.baud = p('baud_rate').value
@@ -96,6 +135,7 @@ class KinovaHapticBridge(Node):
 
         self.tare_samples = int(p('tare_samples').value)
         self.csv_log_path = p('csv_log_path').value
+        self.frame_id = p('derived_frame_id').value
 
         # --- state ---
         self.ser = None
@@ -109,11 +149,23 @@ class KinovaHapticBridge(Node):
         self.tare = TareEstimator(self.tare_samples)
         self.latest = None   # Sample, set by on_wrench once data has arrived
         self.csv_logger = ScrewTorqueCsvLogger(self.csv_log_path)
+        self._last_wrench_process_time = 0.0   # monotonic; see WRENCH_PROCESS_PERIOD_S
 
         self._open_serial()
 
         self.actual_pub = self.create_publisher(Float32, '/pressure/actual_kpa', 10)
         self.echo_pub = self.create_publisher(Float32, '/pressure/target_kpa_echo', 10)
+
+        # Stamped derived signals, for rosbag correlation with the raw wrench.
+        # Both carry the header stamp of the F/T sample they were computed
+        # from, NOT the time they happened to be published, so the whole
+        # chain (wrench -> screw torque -> pad command) lines up on one time
+        # axis in the bag. See TORQUE_FIELDS / PAD_FIELDS below.
+        self.torque_pub = self.create_publisher(
+            Vector3Stamped, '/haptic/screw_torque', 10)
+        self.pad_target_pub = self.create_publisher(
+            Vector3Stamped, '/haptic/pad_target_kpa', 10)
+
         self.create_subscription(WrenchStamped, self.topic, self.on_wrench, 10)
         self.create_subscription(Empty, '~/tare', self.on_tare, 10)
         self.create_subscription(Empty, '~/reset_tare', self.on_reset_tare, 10)
@@ -199,16 +251,28 @@ class KinovaHapticBridge(Node):
     def _recover(self):
         with self.recovery_lock:
             self.get_logger().warn('Telemetry stalled - recovering USB link')
-            self.connected = False
-            try:
-                if self.ser and self.ser.is_open:
-                    self.ser.close()
-            except Exception:
-                pass
+            # close() and write() race on the same pyserial object: a write
+            # already in flight on the executor thread reads from an
+            # internal abort pipe that close() nulls out mid-call, raising
+            # an uncaught TypeError that used to kill the whole process.
+            # write_lock makes the two mutually exclusive; connected is
+            # flipped to False inside it so a write that loses the race
+            # blocks until close() has fully finished, then hits a clean
+            # PortNotOpenError (a SerialException) instead.
+            with self.write_lock:
+                self.connected = False
+                try:
+                    if self.ser and self.ser.is_open:
+                        self.ser.close()
+                except Exception:
+                    pass
 
             self._usb_reset()
 
-            # Wait for the device node to reappear
+            # Wait for the device node to reappear. connected is False for
+            # this whole stretch, so concurrent send() calls return
+            # immediately without touching write_lock - this loop does not
+            # need to hold it.
             deadline = time.time() + 15.0
             while time.time() < deadline and not os.path.exists(self.port):
                 time.sleep(0.5)
@@ -219,7 +283,8 @@ class KinovaHapticBridge(Node):
 
             time.sleep(1.0)      # let udev settle
             try:
-                self._open_serial()
+                with self.write_lock:
+                    self._open_serial()   # sets self.connected = True
                 self.last_sent = None       # force a resend of the target
                 self.get_logger().info('USB link recovered')
             except Exception as e:
@@ -246,10 +311,25 @@ class KinovaHapticBridge(Node):
             except (serial.SerialException, OSError) as e:
                 self.get_logger().error(f'Serial write failed: {e}')
                 self.connected = False
+            except Exception as e:
+                # Belt-and-suspenders: a torn-down pyserial object can raise
+                # outside its own exception hierarchy (see the write_lock
+                # note in _recover). Never let a write failure take the
+                # whole node down.
+                self.get_logger().error(f'Serial write failed unexpectedly: {e}')
+                self.connected = False
 
     # ---------------- input (compute only) ----------------
 
     def on_wrench(self, msg: WrenchStamped):
+        # Decimate: see WRENCH_PROCESS_PERIOD_S. A sensor streaming at
+        # 500 Hz-1 kHz would otherwise run this (and a publish) on every
+        # sample for no benefit, at real risk to the node's own timers.
+        now_mono = time.monotonic()
+        if now_mono - self._last_wrench_process_time < WRENCH_PROCESS_PERIOD_S:
+            return
+        self._last_wrench_process_time = now_mono
+
         force = (msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z)
         torque = (msg.wrench.torque.x, msg.wrench.torque.y, msg.wrench.torque.z)
 
@@ -270,9 +350,35 @@ class KinovaHapticBridge(Node):
         u = compute_u(tau_tared, self.tau_deadband, self.tau_max)
         pA, pB = compute_pad_pressures(u, self.pressure_bias, self.pressure_span)
 
+        stamp = self._source_stamp(msg.header.stamp)
         self.latest = Sample(
-            force=force, torque=torque, tau_raw=st.tau_raw, tau_screw=st.tau_screw,
+            stamp=stamp, force=force, torque=torque, tau_raw=st.tau_raw,
+            tau_screw=st.tau_screw, tau_tared=tau_tared,
             tau_perp_mag=st.tau_perp_mag, u=u, pA=pA, pB=pB)
+
+        # Published at the F/T sensor's own rate, one message per input
+        # sample - the extracted screw component at full fidelity, not
+        # decimated to the 20 Hz serial cadence.
+        self.torque_pub.publish(self._vec3(stamp, st.tau_raw, st.tau_screw, tau_tared))
+
+    def _source_stamp(self, stamp):
+        """Header stamp of the incoming wrench, or now if it is unset.
+
+        A publisher that leaves the stamp at zero (some sim sources do) would
+        otherwise put every derived sample at the epoch in the bag.
+        """
+        if stamp.sec == 0 and stamp.nanosec == 0:
+            return self.get_clock().now().to_msg()
+        return stamp
+
+    def _vec3(self, stamp, x, y, z):
+        m = Vector3Stamped()
+        m.header.stamp = stamp
+        m.header.frame_id = self.frame_id
+        m.vector.x = float(x)
+        m.vector.y = float(y)
+        m.vector.z = float(z)
+        return m
 
     def on_tare(self, _msg: Empty):
         self.tare.start_tare()
@@ -295,6 +401,11 @@ class KinovaHapticBridge(Node):
         if command != self.last_sent:
             self.last_sent = command
             self.send(command)
+
+        # Published unconditionally at the 20 Hz output rate, including when
+        # the command is unchanged and no serial write happens - a bag needs
+        # the commanded value at every tick, not only at the transitions.
+        self.pad_target_pub.publish(self._vec3(s.stamp, s.pA, s.pB, 0.0))
 
         fx, fy, fz = s.force
         tx, ty, tz = s.torque

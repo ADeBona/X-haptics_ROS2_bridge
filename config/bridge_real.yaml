@@ -15,9 +15,9 @@
 
     # Pad mapping
     tau_deadband: 0.05
-    tau_max: 4.0
+    tau_max: 3.0
     pressure_bias: 0.0
-    pressure_span: 60.0
+    pressure_span: 50.0
 
     # Tare (~/tare, ~/reset_tare)
     tare_samples: 20

@@ -79,10 +79,43 @@ placement on the forearm, not differential pressure.
 | `/kinova/sim_torque` | `std_msgs/Float32` | bridge subscribes | torque input |
 | `/pressure/actual_kpa` | `std_msgs/Float32` | bridge publishes | measured pressure |
 | `/pressure/target_kpa_echo` | `std_msgs/Float32` | bridge publishes | target as confirmed by the Arduino |
+| `/haptic/screw_torque` | `geometry_msgs/Vector3Stamped` | real bridge publishes | extracted screw-axis torque |
+| `/haptic/pad_target_kpa` | `geometry_msgs/Vector3Stamped` | real bridge publishes | commanded pad pressures |
 
 `target_kpa_echo` is the ground truth for debugging: it is what the **Arduino**
 believes the target is, not what the bridge sent. If they disagree, commands are
 not landing.
+
+#### Derived topics, for rosbag recording
+
+`Vector3Stamped` has no named fields, so `x/y/z` mean this and only this
+(mirrored by `TORQUE_FIELDS` / `PAD_FIELDS` in `kinova_haptic_bridge.py` — a
+recorded bag is only interpretable through this mapping):
+
+| Topic | x | y | z |
+|-------|---|---|---|
+| `/haptic/screw_torque` | `tau_raw` — raw vertical torque component | `tau_screw` — after the lever-arm correction | `tau_tared` — after tare and `tighten_sign`; this is what drives the pads |
+| `/haptic/pad_target_kpa` | `pA` — group A (tightening), the only channel wired to hardware | `pB` — group B, computed but not actuated yet | unused, always 0 |
+
+These are packed scalars, not geometric vectors — `frame_id` is empty on
+purpose so nothing tries to TF-transform them (override with the
+`derived_frame_id` parameter if your tooling insists on a frame).
+
+Both carry **the header stamp of the F/T sample they were derived from**, not
+the time they were published, so in a bag the whole chain — raw wrench,
+extracted torque, pad command — lines up on one time axis. Both publish at the
+20 Hz output rate: wrench processing is decimated to that cadence regardless
+of the sensor's own publish rate (`WRENCH_PROCESS_PERIOD_S` in
+`kinova_haptic_bridge.py`). Some F/T sensors stream at 500 Hz-1 kHz; running
+the full extraction on every sample bought nothing (the mapping only ever
+acts at 20 Hz) while costing enough rclpy per-message overhead on a Pi to
+starve the node's own USB-stall watchdog (`supervise()`) — see git history /
+commit messages for the incident this fixed. `/haptic/pad_target_kpa`
+publishes on every tick including those where the command is unchanged and
+no serial write occurs.
+
+Both are published by the **real** bridge only. The sim bridge takes a scalar
+torque and never performs the extraction, so it has nothing to put on them.
 
 ---
 
