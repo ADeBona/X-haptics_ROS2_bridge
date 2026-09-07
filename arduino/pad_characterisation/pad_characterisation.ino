@@ -12,7 +12,9 @@
  *   Z                         vent to zero, leave any test mode
  *   R                         reset the max-pressure recorder
  *   S                         report max pressure seen
- *   I,<target>                inflation test: vent, settle, full pump to target
+ *   I,<target>                inflation test: vent, settle, full pump to
+ *                             target, hold AUTO_DUMP_HOLD_MS, then auto
+ *                             vent (fast dump, not PFM) back to 0
  *   F,<target>,<Tmax>,<Tmin>  deflation test: inflate to target, settle,
  *                             top up, then reverse-PFM descent to
  *                             DEFLATE_END_KPA
@@ -40,6 +42,9 @@ const int VALVE_PIN  = 5;
 const float HARD_CEILING_KPA = 80.0;   // absolute refusal, never exceeded
 const float STEP_KPA         = 2.0;    // manual increment
 const float DEADBAND_KPA     = 1.5;
+
+// ---- Auto-dump (inflation test) ----
+const unsigned long AUTO_DUMP_HOLD_MS = 500;   // hold at target before auto-venting
 
 // ---- Reverse-PFM ----
 const unsigned long BURST_MS = 6;      // minimum mechanical actuation time
@@ -74,7 +79,7 @@ float settled_kPa = 0.0;               // the trusted pressure reading
 enum Mode { M_MANUAL, M_INFLATE_TEST, M_DEFLATE_TEST };
 Mode mode = M_MANUAL;
 
-enum Phase { PH_IDLE, PH_VENT, PH_SETTLE, PH_RUN, PH_DONE };
+enum Phase { PH_IDLE, PH_VENT, PH_SETTLE, PH_RUN, PH_HOLD, PH_DUMP, PH_DONE };
 Phase phase = PH_IDLE;
 
 float target_kPa = 0.0;
@@ -171,6 +176,8 @@ const char* stateName() {
     if (phase == PH_VENT)   return "INF_VENT";
     if (phase == PH_SETTLE) return "INF_SETTLE";
     if (phase == PH_RUN)    return "INF_RUN";
+    if (phase == PH_HOLD)   return "INF_HOLD";
+    if (phase == PH_DUMP)   return "INF_DUMP";
     return "INFTEST";
   }
   if (mode == M_DEFLATE_TEST) {
@@ -313,7 +320,33 @@ void loop() {
         setPump(false);
         Serial.print("RESULT,INFLATE,"); Serial.print(now - test_start);
         Serial.print(","); Serial.println(settled_kPa);
-        phase = PH_DONE; target_kPa = test_target;
+        phase = PH_HOLD; phase_start = now;
+      }
+    }
+    else if (phase == PH_HOLD) {
+      // sit at target, valve shut, before the auto-dump
+      setPump(false); setValve(false, now);
+      if (now - phase_start >= AUTO_DUMP_HOLD_MS) {
+        phase = PH_DUMP; phase_start = now;
+        vent_open = true; vent_timer = now;
+        Serial.println("EVT,auto-dump to 0");
+      }
+    }
+    else if (phase == PH_DUMP) {
+      // fast dump: duty-cycled open, same as manual vent-to-zero, not the
+      // controlled reverse-PFM descent used by the deflation test
+      setPump(false);
+      if (vent_open) {
+        setValve(true, now);
+        if (now - vent_timer >= VENT_OPEN_MS) { vent_open = false; vent_timer = now; }
+      } else {
+        setValve(false, now);
+        if (now - vent_timer >= VENT_SAMPLE_MS) { vent_open = true; vent_timer = now; }
+      }
+      if (settled_kPa < 1.0 || now - phase_start > 8000) {
+        setValve(false, now);
+        Serial.println("EVT,dump complete");
+        phase = PH_DONE; target_kPa = 0.0;
         mode = M_MANUAL; log_interval_ms = 100;
       }
     }

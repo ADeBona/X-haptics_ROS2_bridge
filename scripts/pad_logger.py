@@ -69,6 +69,7 @@ class PadRig:
         self.trace = []          # (t_ms, target, actual)
         self.max_seen = 0.0
         self.last_result = None
+        self.last_evt = None
         self.last_actual = 0.0
         self.recording = False
 
@@ -95,22 +96,34 @@ class PadRig:
             elif raw.startswith('RESULT,'):
                 self.last_result = raw
                 print(f'\n  {raw}')
-            elif raw.startswith('EVT,') or raw.startswith('MAX,'):
+            elif raw.startswith('EVT,'):
+                self.last_evt = raw
+                print(f'\n  {raw}')
+            elif raw.startswith('MAX,'):
                 print(f'\n  {raw}')
 
-    def run_test(self, cmd, timeout=90.0):
-        """Send a test command, record the trace until RESULT arrives."""
+    def run_test(self, cmd, timeout=90.0, wait_evt=None):
+        """Send a test command, record the trace until RESULT arrives.
+
+        If wait_evt is given, keep recording past RESULT until an EVT
+        line containing that text shows up (or timeout) - e.g. the
+        inflation test's auto-dump happens after RESULT,INFLATE and
+        would otherwise be cut out of the trace.
+        """
         self.trace = []
         self.last_result = None
+        self.last_evt = None
         self.recording = True
         self.send(cmd)
         t0 = time.time()
         while time.time() - t0 < timeout:
             self.pump_serial()
             if self.last_result:
-                time.sleep(0.3)
-                self.pump_serial()
-                break
+                done = not wait_evt or (self.last_evt and wait_evt in self.last_evt)
+                if done:
+                    time.sleep(0.3)
+                    self.pump_serial()
+                    break
             time.sleep(0.02)
         self.recording = False
         return self.last_result, list(self.trace)
@@ -234,9 +247,9 @@ def main():
             elif choice == '2':
                 tgt = float(input('  target kPa: ').strip())
                 print('  running...')
-                result, trace = rig.run_test(f'I,{tgt:.2f}')
+                result, trace = rig.run_test(f'I,{tgt:.2f}', wait_evt='dump complete')
                 csv_path = os.path.join(outdir, 'inflation.csv')
-                save_csv(csv_path, trace, f'inflation to {tgt} kPa; {result}')
+                save_csv(csv_path, trace, f'inflation to {tgt} kPa, auto-dump; {result}')
                 plot(csv_path, os.path.join(outdir, 'inflation.png'),
                      f'Inflation transient to {tgt:.0f} kPa')
                 if result:
