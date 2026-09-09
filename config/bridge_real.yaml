@@ -14,10 +14,10 @@
     tighten_sign: -1   # TODO confirm: +1 keeps tightening reading positive as-is,
 
     # Pad mapping
-    tau_deadband: 0.05
+    tau_deadband: 0.025
     tau_max: 2.5
     pressure_bias: 0.0
-    pressure_span: 50.0
+    pressure_span: 40.0
 
     # Tare (~/tare, ~/reset_tare)
     tare_samples: 20

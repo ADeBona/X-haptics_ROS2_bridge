@@ -138,6 +138,12 @@ ros2 run kinova_haptic_teleop kinova_haptic_bridge --ros-args \
   --params-file /config/bridge_real.yaml
 ```
 
+if needed
+```bash
+ros2 topic pub /kinova_haptic_bridge/tare std_msgs/msg/Empty "{}" --once
+```
+
+
 Command line, for a one-off override:
 
 ```bash
